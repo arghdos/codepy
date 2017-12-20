@@ -10,3 +10,4 @@ include README.rst
 
 include Makefile.in
 include codepy/include/codepy/*.hpp
+include codepy/include/codepy/*.cpp

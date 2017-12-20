@@ -37,7 +37,8 @@ setup(name="codepy",
       include_package_data=True,
       package_data={
           "codepy": [
-              "include/codepy/*.hpp",
+              "include/codepy/*.hpp"
+              "include/codepy/*.cpp",
               ]
           },
 

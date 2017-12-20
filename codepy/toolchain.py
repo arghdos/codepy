@@ -359,6 +359,234 @@ class NVCCToolchain(GCCLikeToolchain):
 
 # }}}
 
+# {{{ ispc toolchain
+
+
+class ISPCToolchain(GCCLikeToolchain):
+    def __init__(self, *args, **kwargs):
+        """
+        A toolchain capable of compiling ISPC code
+
+        Parameters
+        ----------
+        cc: str ['ispc']
+            The ispc compiler, 'ispc' by default
+        cpp: str ['g++']
+            The c++ compiler, needed for compiling tasksys.cpp
+        use_openmp: bool [True]
+            Whether to use OpenMP or bare pthreads as the ISPC paralleization
+            mechanism -- OpenMP by default
+        target_name: str ['host']
+            The target (e.g., 'avx1', 'sse2', etc.) to compile for.  If not supplied,
+            'host' will be used, which uses the vectorization level of the host
+            machine.  It is the user's responsiblity to ensure that the target /
+            vector width / addressing width combination is valid, otherwise
+            errors may occur at runtime.
+        vector_width: int {2, 4, 8, 16}
+            The vector width to use in ISPC vectorization.  Note that this must
+            correspond to a valid target, see :param:`target_name`
+        address_width: int {32, 64}
+            Select 32- or 64-bit addressing. (Note that 32-bit addressing
+            calculations are done by default, even on 64-bit target architectures.)
+        cppflags: str ['-fPIC']
+            Flags for compilation of tasksys.cpp, by default compiles as a shared
+            PIC object.
+        cflags: str ['--pic']
+            Flags for compilation of an .ispc file.  By default compiles to a shared
+            PIC object
+        """
+
+        cc = kwargs.pop('cc', 'ispc')
+        cpp = kwargs.pop('cpp', 'g++')
+        ld = kwargs.pop('ld', 'ld')
+        use_openmp = kwargs.pop('use_openmp', True)
+        # get defines
+        defines = kwargs.pop('defines', [])
+        # get libraries
+        libraries = kwargs.pop('libraries', [])
+        # update based on OpenMP choice
+        if use_openmp:
+            defines += ['ISPC_USE_OMP']
+            libraries += ['-fopenmp']
+        else:
+            defines += ['ISPC_USE_PTHREADS']
+            libraries += 'pthreads'
+        # find target width
+        target_name = kwargs.pop('target', 'host')
+        vector_width = kwargs.pop('vector_width', None)
+        addressing_width = kwargs.pop('addressing_width', None)
+        target_flags = [target_name, vector_width, addressing_width]
+        if target_name == 'host':
+            target_flags = ['--target', target_name]
+        else:
+            # first find the default system target to fill in gaps
+            if not all(target_flags):
+                import re
+                from tempfile import NamedTemporaryFile
+                with NamedTemporaryFile(prefix='loopy') as tempfile:
+                    tempfile.write(b'void test(){} \n')
+                    result, _, stderr = call_capture_output((
+                        ['ispc', tempfile.name]))
+                if result != 0:
+                    raise RuntimeError("version query failed: "+stderr)
+                # search output
+                for line in stderr.split('\n'):
+                    match = re.search(r'\"([\w\d]+)-i(\d+)x(\d+)\"', line)
+                    if match:
+                        # find defaults, and construct target
+                        target, addressing, width = match.groups()
+                        if not target_name:
+                            target_name = target
+                        if not vector_width:
+                            vector_width = width
+                        if not addressing_width:
+                            addressing_width = addressing
+                        break
+            # and construct the user supplied / default target
+            target_flags = ['--target', '{0}-i{1}x{2}'.format(
+                target_name, addressing_width, vector_width)]
+
+        # get cpp flags
+        cppflags = kwargs.pop('cppflags', ['-fPIC'])
+        cflags = kwargs.pop('cflags', ['--pic'])
+        # add target flags to cflags
+        cflags += target_flags
+        kwargs.update({'cflags': cflags,
+                       'cppflags': cppflags,
+                       'defines': defines,
+                       'libraries': libraries,
+                       'cc': cc,
+                       'cpp': cpp,
+                       'ld': ld})
+
+        super(GCCLikeToolchain, self).__init__(self, *args, **kwargs)
+
+    def get_version_tuple(self):
+        ver = self.get_version()
+        words = ver.split()
+        numbers = words[4].split(".")
+
+        result = []
+        for n in numbers:
+            try:
+                result.append(int(n))
+            except ValueError:
+                # not an integer? too bad.
+                break
+
+        return tuple(result)
+
+    def get_cc(self, files, obj=True):
+        if obj and all(f.endswith('.ispc') for f in files) or not files:
+            return self.cc
+        elif all(f.endswith('.cpp') for f in files):
+            return self.cpp
+        else:
+            return self.ld
+
+    def get_dependencies(self, source_files):
+        building_obj = True
+        if all(source.endswith('.o') for source in source_files):
+            # object file
+            building_obj = False
+
+        cc = self.get_cc(source_files, obj=building_obj)
+        cflags = self.cflags if cc == self.cc else self.cppflags
+
+        from codepy.tools import join_continued_lines
+        from tempfile import NamedTemporaryFile
+        with NamedTemporaryFile(prefix='loopy') as tempfile:
+            depends = ['-MMM', tempfile.name] if cc == 'ispc' else ['-M']
+            result, stdout, stderr = call_capture_output(
+                [cc]
+                + depends
+                + ["-D%s" % define for define in self.defines]
+                + ["-U%s" % undefine for undefine in self.undefines]
+                + ["-I%s" % idir for idir in self.include_dirs]
+                + cflags
+                + source_files
+            )
+
+            if result != 0:
+                raise CompileError("getting dependencies failed: " + stderr)
+
+            lines = join_continued_lines(tempfile.read().decode().split("\n"))
+
+        from pytools import flatten
+        return set(flatten(
+            line.split()[2:] for line in lines))
+
+    def _cmdline(self, file, obj=False):
+        flags = self.cflags
+        cc = self.get_cc(file, obj=obj)
+        if cc != self.cc:
+            # fix flags
+            flags = self.cppflags + (['-c'] if obj else [])
+
+            # check we don't have mixed extensions
+            def __get_ext(f):
+                return f[f.rindex('.') + 1:]
+
+            ext = __get_ext(file[0])
+            if not all(f.endswith(ext) for f in file):
+                ftypes = set([__get_ext(f) for f in file])
+                raise CompileError("Can't compile mixed filetypes: {}".format(
+                    ', '.join(ftypes)))
+
+        if obj:
+            ld_options = []
+            link = []
+        else:
+            ld_options = self.ldflags
+            link = ["-L%s" % ldir for ldir in self.library_dirs]
+            link.extend(["-l%s" % lib if not lib == '-fopenmp' else '-fopenmp'
+                         for lib in self.libraries])
+        return (
+            [cc]
+            + flags
+            + ld_options
+            + ["-D%s" % define for define in self.defines]
+            + ["-U%s" % undefine for undefine in self.undefines]
+            + ["-I%s" % idir for idir in self.include_dirs]
+            + file
+            + link
+        )
+
+    def abi_id(self):
+        return Toolchain.abi_id(self) + [self._cmdline([])]
+
+    def with_optimization_level(self, level, debug=False, **extra):
+        def remove_prefix(l, prefix):
+            return [f for f in l if not f.startswith(prefix)]
+
+        cflags = self.cflags
+        for pfx in ["-O", "-g", "-DNDEBUG"]:
+            cflags = remove_prefix(cflags, pfx)
+
+        if level == "debug":
+            oflags = ["-g"]
+        else:
+            oflags = ["-O%d" % level, "-DNDEBUG"]
+
+        return self.copy(cflags=cflags + oflags)
+
+    def build_extension(self, ext_file, source_files, debug=False):
+        """A simple wrapper around the GCCLikeToolchain's build_extension that
+           ensures that tasksys.cpp is included in the extension
+        """
+
+        if not any(file.endswith('tasksys.cpp') for f in source_files):
+            if debug:
+                print('Adding system tasksys.cpp to source files')
+            from os.path import join, realpath
+            current_dir = realpath(__file__)
+            source_files += [join(current_dir, 'include', 'codepy' 'tasksys.cpp')]
+
+        super(ISPCToolchain, self).build_extension(ext_file, source_files,
+                                                   debug=False)
+
+# }}}
+
 
 # {{{ configuration
 
@@ -380,7 +608,6 @@ def _guess_toolchain_kwargs_from_python_config():
             + make_vars["CFLAGS"].split()
             + make_vars["CFLAGSFORSHARED"].split())
     object_suffix = '.' + make_vars['MODOBJS'].split()[0].split('.')[1]
-    from os.path import join
 
     cflags = []
     defines = []
@@ -469,8 +696,6 @@ def guess_toolchain():
         return GCCToolchain(**kwargs)
     else:
         raise ToolchainGuessError("unknown compiler")
-
-
 
 
 def guess_nvcc_toolchain():
