@@ -29,6 +29,7 @@ THE SOFTWARE.
 
 from codepy import CompileError
 from pytools import Record
+from pytools.prefork import ExecError
 
 
 class Toolchain(Record):
@@ -437,7 +438,11 @@ def guess_toolchain():
     Raise :exc:`ToolchainGuessError` if no toolchain could be found.
     """
     kwargs = _guess_toolchain_kwargs_from_python_config()
-    result, version, stderr = call_capture_output([kwargs["cc"], "--version"])
+    try:
+        result, version, stderr = call_capture_output([kwargs["cc"], "--version"])
+    except ExecError:
+        raise ToolchainGuessError("System compiler {} not found".format(
+            kwargs['cc']))
     if result != 0:
         raise ToolchainGuessError("compiler version query failed: "+stderr)
 
@@ -469,8 +474,6 @@ def guess_toolchain():
         return GCCToolchain(**kwargs)
     else:
         raise ToolchainGuessError("unknown compiler")
-
-
 
 
 def guess_nvcc_toolchain():
